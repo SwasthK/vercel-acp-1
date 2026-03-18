@@ -213,7 +213,8 @@ app.post("/sessions", async (req, res) => {
     res.status(500).json({
       error: "session_create_failed",
       message,
-      details: err,
+      details: safeStringify(err),
+      stack: err instanceof Error ? err.stack : undefined,
     });
   }
 });
@@ -222,7 +223,7 @@ app.post("/sessions", async (req, res) => {
 app.post("/sessions/:id/provider", async (req, res) => {
   const existingSessionId = req.params.id;
 
-  const body = req.body as CreateSessionBody | undefined;
+  const body = req.body as (CreateSessionBody & { authMethodId?: string }) | undefined;
   if (!body || !body.agentCommand) {
     res.status(400).json({ error: "agentCommand_required" });
     return;
@@ -232,7 +233,10 @@ app.post("/sessions/:id/provider", async (req, res) => {
     command: body.agentCommand,
     args: body.args,
     env: body.env,
-    authMethodId: body.authMethodId,
+    // Default required for ACP authMethods, if not provided.
+    authMethodId:
+      body.authMethodId ??
+      (process.env.OPENAI_API_KEY ? "openai-api-key" : undefined),
   };
   const sessionConfig: SessionConfig = {
     cwd: body.cwd ?? process.cwd(),
@@ -256,7 +260,9 @@ app.post("/sessions/:id/provider", async (req, res) => {
 // SSE chat streaming
 app.post("/sessions/:id/chat/stream", async (req, res) => {
   const existingSessionId = req.params.id;
-  const body = req.body as (ChatStreamBody & { agentCommand?: string }) | undefined;
+  const body = req.body as
+    | (ChatStreamBody & { agentCommand?: string; authMethodId?: string })
+    | undefined;
   if (!body || !body.prompt || !body.agentCommand) {
     res.status(400).json({ error: "prompt_required" });
     return;
@@ -270,7 +276,14 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
 
   res.flushHeaders?.();
 
-  const agent: SessionAgentConfig = { command: body.agentCommand };
+  const agent: SessionAgentConfig = {
+    command: body.agentCommand,
+    // The ACP provider requires an authMethodId when the agent exposes authMethods.
+    // From sprite logs, the env-var authMethod id is `openai-api-key`.
+    authMethodId:
+      body.authMethodId ??
+      (process.env.OPENAI_API_KEY ? "openai-api-key" : undefined),
+  };
   const sessionConfig: SessionConfig = { cwd: process.cwd(), mcpServers: [] };
   const entry = await initACPProvider(agent, sessionConfig, existingSessionId);
   const model = entry.provider.languageModel(entry.currentModel, entry.currentMode);

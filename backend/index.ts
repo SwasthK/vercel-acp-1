@@ -5,7 +5,7 @@ import { spritesClient } from "./lib/sprites-client";
 import type { CreateSessionBody, SessionAgentConfig, SessionConfig } from "./types";
 import { normalizeMcpServers } from "./utils";
 
-const NODE_ENV= process.env.NODE_ENV
+const NODE_ENV = process.env.NODE_ENV
 
 const app = express();
 app.use((req, res, next) => {
@@ -116,22 +116,42 @@ async function createSpriteHandler(req: express.Request, res: express.Response) 
     const sprite = spritesClient.sprite(spriteName);
 
     const script = [
-      "set -euo pipefail",
+      // Be tolerant of missing optional vars during provisioning.
+      "set -eo pipefail",
+
+      // cleanup
       "rm -rf vercel-acp-1",
+
+      // clone
       "git clone https://github.com/SwasthK/vercel-acp-1.git",
+
+      // install globals
+      "bun install -g pm2",
       "bun install -g @zed-industries/codex-acp",
       "bun install -g @zed-industries/claude-agent-acp",
-      "bun install -g pm2",
-      // bun global binaries (like pm2) aren't always on PATH in non-interactive shells
-      'export PATH="$(bun pm bin -g):$PATH"',
-      "command -v pm2 && pm2 -v",
-      `export OPENAI_API_KEY=${process.env.OPENAI_API_KEY}`,
+
+      // Use Bun global bin paths directly; don't rely on rc files.
+      'BUN_GLOBAL_BIN="$(bun pm bin -g)"',
+      'export PATH="$BUN_GLOBAL_BIN:$PATH"',
+      'PM2_BIN="$BUN_GLOBAL_BIN/pm2"',
+      'test -x "$PM2_BIN" && "$PM2_BIN" -v',
+      'command -v codex-acp',
+
+      // avoid printing secrets; just verify the var exists
+      'test -n "$OPENAI_API_KEY" && echo "OPENAI_API_KEY=***" || echo "OPENAI_API_KEY missing/empty"',
+
+      // go to server
       "cd vercel-acp-1/server",
+
+      // install deps
       "bun install",
-      // ensure the server binds correctly for external access
-      "PORT=8080 pm2 start index.ts --name vercel-acp-1 --interpreter bun --restart-delay 5000 --max-restarts 10",
-      "pm2 save",
-      "pm2 status",
+
+      // start with pm2 (inject OPENAI_API_KEY explicitly)
+      `OPENAI_API_KEY="${process.env.OPENAI_API_KEY ?? ""}" PORT=8080 "$PM2_BIN" start index.ts --name vercel-acp-1 --interpreter bun --restart-delay 5000 --max-restarts 10`,
+
+      // save process list + show status
+      '"$PM2_BIN" save',
+      '"$PM2_BIN" status',
     ].join("\n");
 
     const cmd = sprite.spawn("bash", ["-lc", script], {
@@ -237,6 +257,11 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
 
     const fetchURL = NODE_ENV === "production" ? `${sprite.url.replace(/\/$/, "")}/sessions` : `${process.env.SERVER_URL}/sessions`;
 
+    // The ACP provider requires an explicit authMethodId to authenticate.
+    // From sprite logs, OPENAI env-var authMethod id is `openai-api-key`.
+    const fallbackAuthMethodId =
+      body.authMethodId ?? (process.env.OPENAI_API_KEY ? "openai-api-key" : undefined);
+
     const upstreamRes = await fetch(fetchURL, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...spriteAuthHeaders },
@@ -244,7 +269,7 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
         agentCommand: agent.command,
         args: agent.args,
         env: agent.env,
-        authMethodId: agent.authMethodId,
+        authMethodId: fallbackAuthMethodId,
         cwd: sessionConfig.cwd,
         mcpServers: body.mcpServers,
       }),
@@ -294,11 +319,11 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
 async function agentChatStreamProxy(req: express.Request, res: express.Response) {
   const body = req.body as
     | {
-        prompt?: string
-        spriteId?: number
-        spriteName?: string
-        agentCommand?: string
-      }
+      prompt?: string
+      spriteId?: number
+      spriteName?: string
+      agentCommand?: string
+    }
     | undefined
 
   const prompt = body?.prompt?.trim()
@@ -324,7 +349,7 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
     res.status(400).json({ error: "sprite_url_missing" })
     return
   }
-  
+
 
   console.log("Sprite found", sprite);
 
@@ -353,6 +378,11 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
         ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY }
         : undefined
 
+    // The ACP provider requires an explicit authMethodId to authenticate.
+    // From sprite logs, OPENAI env-var authMethod id is `openai-api-key`.
+    const createAuthMethodId =
+      process.env.OPENAI_API_KEY ? "openai-api-key" : undefined
+
 
     console.log("Creating session", fetchURL, createEnv, agentCommand);
 
@@ -360,7 +390,7 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
       const createRes = await fetch(fetchURL, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...spriteAuthHeaders },
-        body: JSON.stringify({ agentCommand, env: createEnv }),
+        body: JSON.stringify({ agentCommand, env: createEnv, authMethodId: createAuthMethodId }),
       })
 
       if (createRes.ok) {
@@ -423,9 +453,9 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
 
   console.log("Fetching session");
 
-  const fetchURL = NODE_ENV === "production" ? 
-  `${sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/chat/stream` : 
-  `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/chat/stream`;
+  const fetchURL = NODE_ENV === "production" ?
+    `${sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/chat/stream` :
+    `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/chat/stream`;
 
   const upstream = await fetch(
     fetchURL,
@@ -457,7 +487,7 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
   req.on("close", () => {
     try {
       reader.cancel()
-    } catch {}
+    } catch { }
   })
 
   try {
@@ -489,9 +519,9 @@ async function agentSwitchProviderProxy(req: express.Request, res: express.Respo
   }
 
   const upstreamRes = await fetch(
-    NODE_ENV === "production" ? 
-    `${session.sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/provider` : 
-    `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/provider`,
+    NODE_ENV === "production" ?
+      `${session.sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/provider` :
+      `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/provider`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -535,23 +565,23 @@ app.post('/sprites/run', async (req, res) => {
   const sprite = spritesClient.sprite(spriteName);
 
   const script = [
-    "set -euo pipefail",
+    "set -eo pipefail",
     "rm -rf test-repo",
     "git clone https://github.com/SwasthK/vercel-acp-1.git",
+    "bun install -g pm2",
     "bun install -g @zed-industries/codex-acp",
     "bun install -g @zed-industries/claude-agent-acp",
-    "bun install -g pm2",
-    'export PATH="$(bun pm bin -g):$PATH"',
-    "command -v pm2 && pm2 -v",
-    `export OPENAI_API_KEY=${process.env.OPENAI_API_KEY}`,
-    "printf \"OPENAI_API_KEY=%s\" $OPENAI_API_KEY",
-    "cd vercel-acp-1",
+
+    'BUN_GLOBAL_BIN="$(bun pm bin -g)"',
+    'export PATH="$BUN_GLOBAL_BIN:$PATH"',
+    'PM2_BIN="$BUN_GLOBAL_BIN/pm2"',
+    'test -x "$PM2_BIN" && "$PM2_BIN" -v',
+
+    "cd vercel-acp-1/server",
     "bun install",
-    "pm2 start server/index.ts \
-      --name vercel-acp-1 \
-      --interpreter bun \
-      --restart-delay 5000 \
-      --max-restarts 10"
+    `OPENAI_API_KEY="${process.env.OPENAI_API_KEY ?? ""}" PORT=8080 "$PM2_BIN" start index.ts --name vercel-acp-1 --interpreter bun --restart-delay 5000 --max-restarts 10`,
+    '"$PM2_BIN" save',
+    '"$PM2_BIN" status',
   ].join("\n");
 
   try {
