@@ -124,6 +124,7 @@ async function initACPProvider(
     authMethodId: agent.authMethodId,
     session: sessionConfig,
     persistSession: true,
+    sessionDelayMs: 1000,
   });
 
   const acpSession = await provider.initSession();
@@ -404,7 +405,7 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
   );
 
   try {
-    const { fullStream } = await streamText({
+    const { fullStream } = streamText({
       model,
       prompt: body.prompt,
       tools: entry.provider.tools,
