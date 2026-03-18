@@ -193,7 +193,10 @@ app.post("/sessions", async (req, res) => {
     });
   } catch (error) {
     console.error("Failed to create ACP session", error);
-    res.status(500).json({ error: "session_create_failed" });
+    res.status(500).json({
+      error: "session_create_failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 });
 
