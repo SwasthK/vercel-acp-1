@@ -353,6 +353,9 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
         ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY }
         : undefined
 
+
+    console.log("Creating session", fetchURL, createEnv, agentCommand);
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const createRes = await fetch(fetchURL, {
         method: "POST",
