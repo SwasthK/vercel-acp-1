@@ -320,9 +320,22 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
     res.end();
   } catch (error) {
     console.error("Error during chat stream", error);
+    const err: unknown = error;
+    const safeStringify = (v: unknown) => {
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
     try {
       res.write(`event: error\n`);
-      res.write(`data: ${JSON.stringify({ error: "stream_failed" })}\n\n`);
+      res.write(
+        `data: ${JSON.stringify({
+          error: "stream_failed",
+          details: safeStringify(err),
+        })}\n\n`
+      );
     } finally {
       res.end();
     }
