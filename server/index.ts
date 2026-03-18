@@ -286,7 +286,11 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
   };
   const sessionConfig: SessionConfig = { cwd: process.cwd(), mcpServers: [] };
   const entry = await initACPProvider(agent, sessionConfig, existingSessionId);
+
+  console.log("Entry", entry);
   const model = entry.provider.languageModel(entry.currentModel, entry.currentMode);
+
+  console.log("Model", model);
 
   try {
     const { fullStream } = streamText({
