@@ -324,6 +324,7 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
     res.status(400).json({ error: "sprite_url_missing" })
     return
   }
+  
 
   console.log("Sprite found", sprite);
 
@@ -339,32 +340,66 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
 
   if (!session) {
     console.log("Creating session");
-    const fetchURL = NODE_ENV === "production" ? `${sprite.url.replace(/\/$/, "")}/sessions` : `${process.env.SERVER_URL}/sessions`;
-    const createRes = await fetch(fetchURL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...spriteAuthHeaders },
-      body: JSON.stringify({ agentCommand }),
-    })
+    const fetchURL =
+      NODE_ENV === "production"
+        ? `${sprite.url.replace(/\/$/, "")}/sessions`
+        : `${process.env.SERVER_URL}/sessions`
 
-    if (!createRes.ok) {
-      res
-        .status(502)
-        .json({ error: await createRes.text(), upstreamStatus: createRes.status })
-      return
+    const maxAttempts = 6
+    const baseDelayMs = 1000
+    let json: { sessionId?: string } | null = null
+    const createEnv =
+      process.env.OPENAI_API_KEY
+        ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY }
+        : undefined
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const createRes = await fetch(fetchURL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...spriteAuthHeaders },
+        body: JSON.stringify({ agentCommand, env: createEnv }),
+      })
+
+      if (createRes.ok) {
+        const text = await createRes.text()
+        try {
+          json = JSON.parse(text) as { sessionId?: string }
+        } catch {
+          res
+            .status(502)
+            .json({
+              error: "upstream_non_json",
+              upstreamBody: text.slice(0, 500),
+            })
+          return
+        }
+        break
+      }
+
+      const errText = await createRes.text()
+      let errJson: any = undefined
+      try {
+        errJson = JSON.parse(errText)
+      } catch {
+        errJson = undefined
+      }
+
+      const upstreamStatus = createRes.status
+      const retryable =
+        [502, 503, 504].includes(upstreamStatus) ||
+        (upstreamStatus === 500 && errJson?.error === "session_create_failed")
+
+      if (!retryable || attempt === maxAttempts) {
+        res
+          .status(502)
+          .json({ error: errJson ?? errText, upstreamStatus })
+        return
+      }
+
+      await new Promise((r) => setTimeout(r, baseDelayMs * attempt))
     }
 
-    const text = await createRes.text()
-    let json: { sessionId?: string }
-    try {
-      json = JSON.parse(text) as { sessionId?: string }
-    } catch {
-      res
-        .status(502)
-        .json({ error: "upstream_non_json", upstreamBody: text.slice(0, 500) })
-      return
-    }
-
-    if (!json.sessionId) {
+    if (!json?.sessionId) {
       res.status(502).json({ error: "upstream_missing_sessionId" })
       return
     }
