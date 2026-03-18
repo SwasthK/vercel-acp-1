@@ -193,9 +193,27 @@ app.post("/sessions", async (req, res) => {
     });
   } catch (error) {
     console.error("Failed to create ACP session", error);
+    const err: unknown = error;
+    const safeStringify = (v: unknown) => {
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
+
+    const message =
+      err instanceof Error
+        ? err.message
+        : typeof err === "string"
+          ? err
+          : // Many libraries throw plain objects; preserve their contents.
+            safeStringify(err);
+
     res.status(500).json({
       error: "session_create_failed",
-      message: error instanceof Error ? error.message : String(error),
+      message,
+      details: err,
     });
   }
 });
