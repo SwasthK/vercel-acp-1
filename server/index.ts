@@ -81,6 +81,19 @@ type ChatStreamBody = {
   prompt: string;
 };
 
+// Fast + reliable: keep ACP providers in memory.
+// Codex `existingSessionId` resume is currently failing with -32002, so we avoid it.
+const sessions = new Map<string, SessionEntry>();
+
+function getSessionOr404(id: string, res: Response): SessionEntry | undefined {
+  const entry = sessions.get(id);
+  if (!entry) {
+    res.status(404).json({ error: "session_not_found" });
+    return undefined;
+  }
+  return entry;
+}
+
 function normalizeMcpServers(
   input: McpServerInput[] | undefined
 ): SessionConfig["mcpServers"] {
@@ -113,22 +126,22 @@ function normalizeMcpServers(
 
 async function initACPProvider(
   agent: SessionAgentConfig,
-  sessionConfig: SessionConfig,
-  existingSessionId?: string
+  sessionConfig: SessionConfig
 ): Promise<SessionEntry> {
   const provider = createACPProvider({
     command: agent.command,
     args: agent.args ?? [],
-    env: agent.env,
+    env: {
+      ...agent.env,
+      ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
+    },
     authMethodId: agent.authMethodId,
     session: sessionConfig,
     persistSession: true,
-    sessionDelayMs: 1000,
-    existingSessionId,
+    sessionDelayMs: 1000
   });
 
   const acpSession = await provider.initSession();
-
   const id = acpSession.sessionId;
   const createdAt = Date.now();
 
@@ -145,7 +158,7 @@ async function initACPProvider(
     updatedAt: createdAt,
     agent,
     sessionConfig,
-    acpSessionId: acpSession.sessionId,
+    acpSessionId: id,
     availableModels: models,
     availableModes: modes,
     currentModel: models[0],
@@ -177,7 +190,9 @@ app.post("/sessions", async (req, res) => {
     command: body.agentCommand,
     args: body.args,
     env: body.env,
-    authMethodId: body.authMethodId,
+    authMethodId:
+      body.authMethodId ??
+      (process.env.OPENAI_API_KEY ? "openai-api-key" : undefined),
   };
 
   const sessionConfig: SessionConfig = {
@@ -187,9 +202,12 @@ app.post("/sessions", async (req, res) => {
 
   try {
     const entry = await initACPProvider(agent, sessionConfig);
+    sessions.set(entry.id, entry);
     res.status(201).json({
       sessionId: entry.id,
       createdAt: entry.createdAt,
+      models: entry.availableModels,
+      modes: entry.availableModes,
     });
   } catch (error) {
     console.error("Failed to create ACP session", error);
@@ -221,13 +239,16 @@ app.post("/sessions", async (req, res) => {
 
 // Update provider for an existing session
 app.post("/sessions/:id/provider", async (req, res) => {
-  const existingSessionId = req.params.id;
+  const id = req.params.id;
 
   const body = req.body as (CreateSessionBody & { authMethodId?: string }) | undefined;
   if (!body || !body.agentCommand) {
     res.status(400).json({ error: "agentCommand_required" });
     return;
   }
+
+  const entry = getSessionOr404(id, res);
+  if (!entry) return;
 
   const agent: SessionAgentConfig = {
     command: body.agentCommand,
@@ -244,12 +265,24 @@ app.post("/sessions/:id/provider", async (req, res) => {
   };
 
   try {
-    const updated = await initACPProvider(agent, sessionConfig, existingSessionId);
+    try {
+      entry.provider.cleanup();
+    } catch {}
+
+    const updated = await initACPProvider(agent, sessionConfig);
+    const merged: SessionEntry = {
+      ...updated,
+      id: entry.id,
+      createdAt: entry.createdAt,
+      updatedAt: Date.now(),
+    };
+    sessions.set(entry.id, merged);
+
     res.status(200).json({
-      sessionId: updated.id,
-      models: updated.availableModels,
-      modes: updated.availableModes,
-      agent: updated.agent,
+      sessionId: merged.id,
+      models: merged.availableModels,
+      modes: merged.availableModes,
+      agent: merged.agent,
     });
   } catch (error) {
     console.error("Failed to update provider", error);
@@ -259,16 +292,17 @@ app.post("/sessions/:id/provider", async (req, res) => {
 
 // SSE chat streaming
 app.post("/sessions/:id/chat/stream", async (req, res) => {
-  const existingSessionId = req.params.id;
+  const id = req.params.id;
   const body = req.body as
-    | (ChatStreamBody & { agentCommand?: string; authMethodId?: string })
+    | (ChatStreamBody & { agentCommand?: string })
     | undefined;
-  if (!body || !body.prompt || !body.agentCommand) {
+  if (!body || !body.prompt) {
     res.status(400).json({ error: "prompt_required" });
     return;
   }
 
-  console.log("Chat streaming", body);
+  const entry = getSessionOr404(id, res);
+  if (!entry) return;
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -276,21 +310,7 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
 
   res.flushHeaders?.();
 
-  const agent: SessionAgentConfig = {
-    command: body.agentCommand,
-    // The ACP provider requires an authMethodId when the agent exposes authMethods.
-    // From sprite logs, the env-var authMethod id is `openai-api-key`.
-    authMethodId:
-      body.authMethodId ??
-      (process.env.OPENAI_API_KEY ? "openai-api-key" : undefined),
-  };
-  const sessionConfig: SessionConfig = { cwd: process.cwd(), mcpServers: [] };
-  const entry = await initACPProvider(agent, sessionConfig, existingSessionId);
-
-  console.log("Entry", entry);
   const model = entry.provider.languageModel(entry.currentModel, entry.currentMode);
-
-  console.log("Model", model);
 
   try {
     const { fullStream } = streamText({
@@ -299,8 +319,6 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
       tools: entry.provider.tools,
       includeRawChunks: true,
     });
-
-    console.log("Full stream", fullStream);
 
     for await (const part of fullStream) {
       if (part.type === "text-delta") {
@@ -332,12 +350,15 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
         return String(v);
       }
     };
+    const errStr = safeStringify(err);
+    // Ensure the real error is visible in PM2 logs (plain objects otherwise show as [object Object]).
+    console.error("Error during chat stream (safe)", errStr);
     try {
       res.write(`event: error\n`);
       res.write(
         `data: ${JSON.stringify({
           error: "stream_failed",
-          details: safeStringify(err),
+          details: errStr,
         })}\n\n`
       );
     } finally {
