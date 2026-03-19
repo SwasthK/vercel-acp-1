@@ -317,18 +317,19 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
       return;
     }
 
+    console.log("FETCH URL", fetchURL);
+
     const upstreamRes = await fetch(fetchURL, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...spriteAuthHeaders },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        agentCommand: agent.command,
-        args: agent.args,
-        env: agent.env,
-        authMethodId: fallbackAuthMethodId,
-        cwd: sessionConfig.cwd,
-        mcpServers: body.mcpServers,
+        agentCommand: "codex-acp",
+        authMethodId: "openai-api-key",
+        // mcpServers: body.mcpServers,
       }),
     });
+
+    console.log("UPSTREAM RES", upstreamRes);
 
     if (!upstreamRes.ok) {
       res.status(502).json({

@@ -384,8 +384,19 @@ app.get("/sessions/:id/history", async (req, res) => {
 
     res.status(200).json({ sessionId, updates });
   } catch (e) {
+    const err: unknown = e;
+    const safeStringify = (v: unknown) => {
+      try {
+        return JSON.stringify(v);
+      } catch {
+        return String(v);
+      }
+    };
     res.status(502).json({
-      error: e instanceof Error ? e.message : String(e),
+      error: "history_load_failed",
+      message: err instanceof Error ? err.message : safeStringify(err),
+      details: safeStringify(err),
+      stack: err instanceof Error ? err.stack : undefined,
     });
   } finally {
     try {
