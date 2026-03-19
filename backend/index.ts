@@ -70,7 +70,7 @@ async function createSpriteHandler(req: express.Request, res: express.Response) 
         body: JSON.stringify({
           name,
           url_settings: {
-            auth: "sprite",
+            auth: "public",
           },
         }),
         headers: {
@@ -250,6 +250,12 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
   }
 
   try {
+    // One session per sprite (best-effort): reuse latest session for spriteId.
+    let existing = await prisma.agentSession.findFirst({
+      where: { spriteId: sprite.id },
+      orderBy: { updatedAt: "desc" },
+    });
+
     const spriteAuthHeaders: Record<string, string> = {};
     if (process.env.SPRITES_TOKEN) {
       spriteAuthHeaders["Authorization"] = `Bearer ${process.env.SPRITES_TOKEN}`;
@@ -261,6 +267,55 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
     // From sprite logs, OPENAI env-var authMethod id is `openai-api-key`.
     const fallbackAuthMethodId =
       body.authMethodId ?? (process.env.OPENAI_API_KEY ? "openai-api-key" : undefined);
+
+    if (existing) {
+      // Switch provider for this sprite session if needed.
+      if (existing.agentCommand !== agent.command) {
+        const providerURL =
+          NODE_ENV === "production"
+            ? `${sprite.url.replace(/\/$/, "")}/sessions/${existing.remoteSessionId}/provider`
+            : `${process.env.SERVER_URL}/sessions/${existing.remoteSessionId}/provider`;
+
+        const upstreamSwitch = await fetch(providerURL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...spriteAuthHeaders },
+          body: JSON.stringify({
+            agentCommand: agent.command,
+            args: agent.args,
+            env: agent.env,
+            authMethodId: fallbackAuthMethodId,
+            cwd: sessionConfig.cwd,
+            mcpServers: body.mcpServers,
+          }),
+        });
+
+        if (!upstreamSwitch.ok) {
+          res.status(502).json({
+            error: await upstreamSwitch.text(),
+            upstreamStatus: upstreamSwitch.status,
+          });
+          return;
+        }
+
+        existing = await prisma.agentSession.update({
+          where: { remoteSessionId: existing.remoteSessionId },
+          data: { agentCommand: agent.command },
+        });
+      } else {
+        existing = await prisma.agentSession.update({
+          where: { remoteSessionId: existing.remoteSessionId },
+          data: {},
+        });
+      }
+
+      res.status(200).json({
+        id: existing.id,
+        sessionId: existing.remoteSessionId,
+        spriteId: existing.spriteId,
+        spriteUrl: sprite.url,
+      });
+      return;
+    }
 
     const upstreamRes = await fetch(fetchURL, {
       method: "POST",
@@ -451,8 +506,6 @@ async function agentChatStreamProxy(req: express.Request, res: express.Response)
     })
   }
 
-  console.log("Fetching session");
-
   const fetchURL = NODE_ENV === "production" ?
     `${sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/chat/stream` :
     `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/chat/stream`;
@@ -524,7 +577,12 @@ async function agentSwitchProviderProxy(req: express.Request, res: express.Respo
       `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/provider`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(process.env.SPRITES_TOKEN
+          ? { Authorization: `Bearer ${process.env.SPRITES_TOKEN}` }
+          : {}),
+      },
       body: JSON.stringify(body),
     }
   );
@@ -552,6 +610,46 @@ app.post("/sprites/destroy", destroySpriteHandler);
 app.post("/agent/sessions", createAgentSessionHandler);
 app.post("/agent/sessions/:id/chat/stream", agentChatStreamProxy);
 app.post("/agent/sessions/:id/provider", agentSwitchProviderProxy);
+app.get("/agent/sessions/:id/history", async (req, res) => {
+  const sessionId = String(req.params.id);
+  const agentCommand = String(req.query.agentCommand ?? "").trim();
+  if (!agentCommand) {
+    res.status(400).json({ error: "agentCommand_required" });
+    return;
+  }
+
+  const session = await prisma.agentSession.findUnique({
+    where: { remoteSessionId: sessionId },
+    include: { sprite: true },
+  });
+  if (!session?.sprite.url) {
+    res.status(404).json({ error: "session_not_found" });
+    return;
+  }
+
+  const spriteAuthHeaders: Record<string, string> = {};
+  if (process.env.SPRITES_TOKEN) {
+    spriteAuthHeaders["Authorization"] = `Bearer ${process.env.SPRITES_TOKEN}`;
+  }
+
+  const historyURL =
+    NODE_ENV === "production"
+      ? `${session.sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/history?agentCommand=${encodeURIComponent(agentCommand)}`
+      : `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/history?agentCommand=${encodeURIComponent(agentCommand)}`;
+
+  const upstream = await fetch(historyURL, {
+    method: "GET",
+    headers: { ...spriteAuthHeaders },
+  });
+
+  const text = await upstream.text();
+  if (!upstream.ok) {
+    res.status(502).json({ error: text, upstreamStatus: upstream.status });
+    return;
+  }
+
+  res.status(200).type("application/json").send(text);
+});
 app.post("/agent/chat/stream", agentChatStreamProxy);
 
 // As a fallback, we can run the sprite script manually
