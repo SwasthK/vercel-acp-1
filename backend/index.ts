@@ -6,6 +6,10 @@ import type { CreateSessionBody, SessionAgentConfig, SessionConfig } from "./typ
 import { normalizeMcpServers } from "./utils";
 
 const NODE_ENV = process.env.NODE_ENV
+// ACP session persistence can be scoped to cwd.
+// Always use a stable cwd that exists inside the sprite filesystem.
+const SPRITE_DEFAULT_CWD =
+  process.env.SPRITE_CWD ?? "/home/sprite/vercel-acp-1/server"
 
 const app = express();
 app.use((req, res, next) => {
@@ -235,7 +239,7 @@ async function createAgentSessionHandler(req: express.Request, res: express.Resp
   };
 
   const sessionConfig: SessionConfig = {
-    cwd: body.cwd ?? process.cwd(),
+    cwd: body.cwd ?? SPRITE_DEFAULT_CWD,
     mcpServers: normalizeMcpServers(body.mcpServers),
   };
 
@@ -635,8 +639,8 @@ app.get("/agent/sessions/:id/history", async (req, res) => {
 
   const historyURL =
     NODE_ENV === "production"
-      ? `${session.sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/history?agentCommand=${encodeURIComponent(agentCommand)}`
-      : `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/history?agentCommand=${encodeURIComponent(agentCommand)}`;
+      ? `${session.sprite.url.replace(/\/$/, "")}/sessions/${session.remoteSessionId}/history?agentCommand=${encodeURIComponent(agentCommand)}&cwd=${encodeURIComponent(SPRITE_DEFAULT_CWD)}`
+      : `${process.env.SERVER_URL}/sessions/${session.remoteSessionId}/history?agentCommand=${encodeURIComponent(agentCommand)}&cwd=${encodeURIComponent(SPRITE_DEFAULT_CWD)}`;
 
   const upstream = await fetch(historyURL, {
     method: "GET",
