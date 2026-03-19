@@ -453,36 +453,89 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
       includeRawChunks: true,
     });
 
+    const normalizeToolCallPart = (part: any) => {
+      const toolCallId = String(part?.toolCallId ?? "");
+      const toolName = String(part?.toolName ?? "tool");
+      const input = part?.input && typeof part.input === "object" ? part.input : undefined;
+
+      // ACP wrapper tool: unwrap the actual tool identity and args.
+      if (toolName === "acp.acp_provider_agent_dynamic_tool" && input) {
+        const innerName =
+          typeof input.toolName === "string" ? input.toolName : toolName;
+        const innerArgs =
+          input.args && typeof input.args === "object" ? input.args : undefined;
+        const innerCallId =
+          typeof input.toolCallId === "string" ? input.toolCallId : toolCallId;
+
+        return {
+          toolCallId: innerCallId || toolCallId,
+          toolName: innerName,
+          title: innerName,
+          args: innerArgs,
+        };
+      }
+
+      return {
+        toolCallId,
+        toolName,
+        title: toolName,
+        args:
+          (part?.args && typeof part.args === "object" ? part.args : undefined) ??
+          input,
+      };
+    };
+
+    const normalizeToolResultPart = (part: any) => {
+      const toolCallId = String(part?.toolCallId ?? "");
+      const toolName = String(part?.toolName ?? "tool");
+      const input = part?.input && typeof part.input === "object" ? part.input : undefined;
+      const output = part?.output;
+
+      if (toolName === "acp.acp_provider_agent_dynamic_tool" && input) {
+        const innerName =
+          typeof input.toolName === "string" ? input.toolName : toolName;
+        const innerCallId =
+          typeof input.toolCallId === "string" ? input.toolCallId : toolCallId;
+
+        return {
+          toolCallId: innerCallId || toolCallId,
+          toolName: innerName,
+          title: innerName,
+          result: output,
+        };
+      }
+
+      return {
+        toolCallId,
+        toolName,
+        title: toolName,
+        result:
+          (part?.result !== undefined ? part.result : undefined) ??
+          output,
+      };
+    };
+
     for await (const part of fullStream) {
       if (part.type === "text-delta") {
         const payload = { text: part.text };
         res.write(`event: token\n`);
         res.write(`data: ${JSON.stringify(payload)}\n\n`);
       } else if (part.type === "tool-call") {
-        // Forward tool call events so the client can render a stable tool timeline.
+        const payload = normalizeToolCallPart(part);
         res.write(`event: tool-call\n`);
-        res.write(
-          `data: ${JSON.stringify({
-            toolCallId: (part as any).toolCallId,
-            toolName: (part as any).toolName,
-            args: (part as any).args,
-          })}\n\n`,
-        );
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
       } else if (part.type === "tool-result") {
+        const payload = normalizeToolResultPart(part);
         res.write(`event: tool-result\n`);
-        res.write(
-          `data: ${JSON.stringify({
-            toolCallId: (part as any).toolCallId,
-            toolName: (part as any).toolName,
-            result: (part as any).result,
-          })}\n\n`,
-        );
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
       } else if (part.type === "tool-error") {
+        const normalized = normalizeToolCallPart(part);
         res.write(`event: tool-error\n`);
         res.write(
           `data: ${JSON.stringify({
-            toolCallId: (part as any).toolCallId,
-            toolName: (part as any).toolName,
+            toolCallId: normalized.toolCallId,
+            toolName: normalized.toolName,
+            title: normalized.title,
             error: (part as any).error,
           })}\n\n`,
         );
