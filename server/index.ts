@@ -377,7 +377,25 @@ app.get("/sessions/:id/history", async (req, res) => {
       }
     }
 
-    await conn.loadSession({ sessionId, cwd, mcpServers: [] });
+    try {
+      await conn.loadSession({ sessionId, cwd, mcpServers: [] });
+    } catch (e) {
+      // Observed behavior (Codex): a brand-new sessionId may not be loadable
+      // until at least one message has been exchanged. In that case, treat
+      // history as empty instead of surfacing an error.
+      const err = e as any;
+      const code = typeof err?.code === "number" ? err.code : undefined;
+      const msg = typeof err?.message === "string" ? err.message : "";
+      if (code === -32002 || /Resource not found/i.test(msg)) {
+        res.status(200).json({
+          sessionId,
+          updates: [],
+          note: "history_not_available_yet",
+        });
+        return;
+      }
+      throw e;
+    }
 
     // Small delay to allow any trailing replay notifications to flush.
     await new Promise((r) => setTimeout(r, 250));
