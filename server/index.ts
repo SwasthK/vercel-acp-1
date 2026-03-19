@@ -6,6 +6,15 @@ import {
 } from "@mcpc-tech/acp-ai-provider";
 import { streamText } from "ai";
 import type { Request, Response } from "express";
+import {
+  ClientSideConnection,
+  PROTOCOL_VERSION,
+  ndJsonStream,
+  type SessionNotification,
+  type Client,
+} from "@agentclientprotocol/sdk";
+import { Readable, Writable } from "node:stream";
+import { spawn } from "node:child_process";
 
 // Basic CORS to allow custom UIs from other origins
 function corsMiddleware(req: Request, res: Response, next: () => void) {
@@ -287,6 +296,101 @@ app.post("/sessions/:id/provider", async (req, res) => {
   } catch (error) {
     console.error("Failed to update provider", error);
     res.status(500).json({ error: "provider_update_failed" });
+  }
+});
+
+class HistoryClient implements Client {
+  private onSessionUpdate?: (n: SessionNotification) => void;
+  setSessionUpdateHandler(handler: (notification: SessionNotification) => void) {
+    this.onSessionUpdate = handler;
+  }
+  sessionUpdate(params: SessionNotification): Promise<void> {
+    this.onSessionUpdate?.(params);
+    return Promise.resolve();
+  }
+  requestPermission(): any {
+    return Promise.resolve({
+      outcome: { outcome: "selected", optionId: "allow" },
+    });
+  }
+  writeTextFile(): any {
+    throw new Error("Not implemented");
+  }
+  readTextFile(): any {
+    throw new Error("Not implemented");
+  }
+}
+
+// Fetch conversation by asking the agent to replay history via ACP `session/load`.
+// This does NOT rely on our in-memory transcript.
+app.get("/sessions/:id/history", async (req, res) => {
+  const sessionId = req.params.id;
+  const agentCommand = String(req.query.agentCommand ?? "").trim();
+  if (!agentCommand) {
+    res.status(400).json({ error: "agentCommand_required" });
+    return;
+  }
+
+  const cwd = String(req.query.cwd ?? process.cwd());
+  const authMethodId =
+    String(req.query.authMethodId ?? "").trim() ||
+    (process.env.OPENAI_API_KEY ? "openai-api-key" : "");
+
+  const updates: SessionNotification[] = [];
+
+  const child = spawn(agentCommand, [], {
+    stdio: ["pipe", "pipe", "pipe"],
+    cwd,
+    env: {
+      ...process.env,
+      ...(process.env.OPENAI_API_KEY ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY } : {}),
+    },
+  });
+
+  try {
+    if (!child.stdout || !child.stdin) {
+      res.status(500).json({ error: "spawn_failed" });
+      return;
+    }
+
+    const input = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
+    const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
+
+    const client = new HistoryClient();
+    client.setSessionUpdateHandler((n) => updates.push(n));
+
+    const conn = new ClientSideConnection(() => client, ndJsonStream(input, output));
+    await conn.initialize({
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+      },
+    });
+
+    // If auth method is available, try to authenticate proactively.
+    if (authMethodId) {
+      try {
+        await conn.authenticate({ methodId: authMethodId });
+      } catch {
+        // ignore; many agents do lazy auth
+      }
+    }
+
+    await conn.loadSession({ sessionId, cwd, mcpServers: [] });
+
+    // Small delay to allow any trailing replay notifications to flush.
+    await new Promise((r) => setTimeout(r, 250));
+
+    res.status(200).json({ sessionId, updates });
+  } catch (e) {
+    res.status(502).json({
+      error: e instanceof Error ? e.message : String(e),
+    });
+  } finally {
+    try {
+      child.kill();
+    } catch {}
   }
 });
 
