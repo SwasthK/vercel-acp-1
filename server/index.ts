@@ -458,6 +458,34 @@ app.post("/sessions/:id/chat/stream", async (req, res) => {
         const payload = { text: part.text };
         res.write(`event: token\n`);
         res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      } else if (part.type === "tool-call") {
+        // Forward tool call events so the client can render a stable tool timeline.
+        res.write(`event: tool-call\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            toolCallId: (part as any).toolCallId,
+            toolName: (part as any).toolName,
+            args: (part as any).args,
+          })}\n\n`,
+        );
+      } else if (part.type === "tool-result") {
+        res.write(`event: tool-result\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            toolCallId: (part as any).toolCallId,
+            toolName: (part as any).toolName,
+            result: (part as any).result,
+          })}\n\n`,
+        );
+      } else if (part.type === "tool-error") {
+        res.write(`event: tool-error\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            toolCallId: (part as any).toolCallId,
+            toolName: (part as any).toolName,
+            error: (part as any).error,
+          })}\n\n`,
+        );
       } else if (part.type === "raw" && part.rawValue) {
         let data: unknown;
         try {
